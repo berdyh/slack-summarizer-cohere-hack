@@ -6,3 +6,4 @@ PLAN.md
 architecture.md
 __pycache__
 .venv
+data/

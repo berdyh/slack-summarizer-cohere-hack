@@ -22,3 +22,16 @@ structlog>=23.2.0
 
 # Performance and caching
 redis>=5.0.0
+
+# Phase 5: Production Database Integration
+# Vector database
+lancedb>=0.3.0
+pyarrow>=12.0.0
+
+# Relational database
+asyncpg>=0.29.0
+sqlalchemy>=2.0.0
+alembic>=1.12.0  # Database migrations
+
+# Data validation
+pydantic>=2.5.0

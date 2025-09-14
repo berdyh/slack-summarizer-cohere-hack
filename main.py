@@ -48,6 +48,12 @@ from admin_tools import (
     generate_admin_token, verify_admin_token, log_admin_action
 )
 
+# Import data models
+from models import SlackInstallation, SlackUser, SlackMessage, RAGResponse
+
+# Import Phase 5 database module
+from database import db_manager, get_installation, store_installation, get_user, store_user
+
 # Environment setup
 SLACK_CLIENT_ID = os.getenv("SLACK_CLIENT_ID")
 SLACK_CLIENT_SECRET = os.getenv("SLACK_CLIENT_SECRET") 
@@ -58,11 +64,30 @@ COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 if not all([SLACK_CLIENT_ID, SLACK_CLIENT_SECRET, SLACK_SIGNING_SECRET, COHERE_API_KEY]):
     raise ValueError("Missing required environment variables. Check SLACK_CLIENT_ID, SLACK_CLIENT_SECRET, SLACK_SIGNING_SECRET, COHERE_API_KEY")
 
+# Initialize Cohere client
+cohere_client = cohere.Client(COHERE_API_KEY)
+
+# Lifespan event handler for database initialization
+from contextlib import asynccontextmanager
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Initialize database on startup"""
+    try:
+        await db_manager.initialize()
+        print("Database initialization complete")
+    except Exception as e:
+        print(f"Database initialization failed: {e}")
+        # Continue with in-memory fallback for development
+    yield
+    # Cleanup code can go here if needed
+
 # Initialize services
 app = FastAPI(
     title="Slack RAG Bot", 
     version="0.1.0",
-    description="AI-powered question answering for Slack workspaces using Cohere RAG"
+    description="AI-powered question answering for Slack workspaces using Cohere RAG",
+    lifespan=lifespan
 )
 
 # Add CORS middleware for development
@@ -74,9 +99,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Cohere client
-cohere_client = cohere.Client(COHERE_API_KEY)
-
 # In-memory storage (will be replaced with proper database in production)
 INSTALLATIONS = {}  # team_id -> SlackInstallation
 MESSAGE_VECTORS = defaultdict(list)  # team_id -> list of (vector, metadata)
@@ -84,51 +106,7 @@ VECTOR_CACHE = {}  # text_hash -> vector for caching
 USER_CACHE = {}  # (team_id, user_id) -> SlackUser
 
 # === Data Models ===
-
-@dataclass
-class SlackInstallation:
-    """Multi-tenant installation data model"""
-    team_id: str              # Primary tenant identifier
-    installer_user_id: str    # Who installed the app
-    bot_access_token: str     # Bot token (should be encrypted in production)
-    scopes: List[str]         # Granted permissions
-    installation_time: datetime
-    channel_allowlist: List[str] = None  # Admin-selected channels
-    retention_days: int = 90  # Data retention policy
-    is_active: bool = True
-    settings: Dict[str, Any] = None  # Additional settings
-
-@dataclass
-class SlackUser:
-    """Slack user information cache"""
-    team_id: str
-    user_id: str
-    username: str = None
-    display_name: str = None
-    is_admin: bool = False
-    last_updated: datetime = None
-
-@dataclass
-class SlackMessage:
-    """Slack message data model"""
-    team_id: str
-    channel_id: str
-    user_id: str
-    text: str
-    ts: str
-    thread_ts: Optional[str] = None
-    message_type: str = "message"
-    has_files: bool = False
-    permalink: Optional[str] = None
-
-@dataclass 
-class RAGResponse:
-    """RAG response model"""
-    answer: str
-    sources: List[str]
-    confidence: float
-    processing_time: float
-    query: str
+# Models are now imported from models.py to avoid circular imports
 
 # === Phase 0: OAuth Implementation ===
 
@@ -176,23 +154,31 @@ async def slack_oauth(code: str):
             return oauth_error_response(f"OAuth failed: {error_msg}")
         
         team_id = data["team"]["id"]
+        team_domain = data["team"].get("domain", "workspace")  # Extract team domain
         bot_token = data["access_token"]
         installer_user_id = data["authed_user"]["id"]
         scopes = data["scope"].split(",")
         
-        print(f"Creating installation for team: {team_id}")
+        print(f"Creating installation for team: {team_id} (domain: {team_domain})")
         
         # Create installation record
         installation = SlackInstallation(
             team_id=team_id,
+            team_domain=team_domain,
             installer_user_id=installer_user_id,
             bot_access_token=bot_token,
             scopes=scopes,
-            installation_time=datetime.utcnow(),
+            installation_time=datetime.now(),
             settings={}
         )
         
-        # Store installation (in-memory for MVP)
+        # Store installation in database and in-memory (for backward compatibility)
+        try:
+            await store_installation(installation)
+        except Exception as e:
+            print(f"Failed to store installation in database: {e}")
+            print("Continuing with in-memory storage only")
+        
         INSTALLATIONS[team_id] = installation
         print(f"Installation stored. Total installations: {len(INSTALLATIONS)}")
         
@@ -211,7 +197,7 @@ async def slack_oauth(code: str):
 
 async def index_workspace_messages(team_id: str, bot_token: str):
     """Enhanced backfill strategy for new installations"""
-    print(f"🔄 Starting backfill indexing for team {team_id}")
+    print(f"Starting backfill indexing for team {team_id}")
     
     try:
         async with httpx.AsyncClient() as client:
@@ -240,7 +226,7 @@ async def index_workspace_messages(team_id: str, bot_token: str):
                 
                 channels_data = channels_response.json()
                 if not channels_data.get("ok"):
-                    print(f"❌ Failed to get channels: {channels_data.get('error')}")
+                    print(f"Failed to get channels: {channels_data.get('error')}")
                     break
                 
                 channels.extend(channels_data.get("channels", []))
@@ -255,7 +241,7 @@ async def index_workspace_messages(team_id: str, bot_token: str):
             
             # Limit to first 10 channels for MVP
             channels = channels[:10]
-            print(f"📁 Found {len(channels)} channels to index")
+            print(f"Found {len(channels)} channels to index")
             
             # Debug: Show channel details
             accessible_channels = []
@@ -266,8 +252,8 @@ async def index_workspace_messages(team_id: str, bot_token: str):
                     accessible_channels.append(channel)
             
             if not accessible_channels:
-                print("⚠️  No accessible channels found. The bot needs to be invited to channels to read messages.")
-                print("💡 To fix this:")
+                print("No accessible channels found. The bot needs to be invited to channels to read messages.")
+                print("To fix this:")
                 print("   1. Go to any channel in Slack")
                 print("   2. Type: /invite @YourBotName")
                 print("   3. Or add the bot to channels via channel settings")
@@ -280,7 +266,7 @@ async def index_workspace_messages(team_id: str, bot_token: str):
                         await post_slack_message(
                             installation.bot_access_token,
                             installation.installer_user_id,  # DM the installer
-                            "🤖 **RAG Bot Setup Required**\n\n"
+                            "**RAG Bot Setup Required**\n\n"
                             "I've been installed but I need to be invited to channels to read messages.\n\n"
                             "**To get started:**\n"
                             "1. Go to any channel where you want me to read messages\n"
@@ -300,7 +286,7 @@ async def index_workspace_messages(team_id: str, bot_token: str):
                 channel_id = channel["id"]
                 channel_name = channel["name"]
                 
-                print(f"📥 Indexing #{channel_name}")
+                print(f"Indexing #{channel_name}")
                 
                 # Get channel history with pagination
                 cursor = None
@@ -320,11 +306,11 @@ async def index_workspace_messages(team_id: str, bot_token: str):
                     
                     history_data = history_response.json()
                     if not history_data.get("ok"):
-                        print(f"❌ Failed to get history for #{channel_name}: {history_data.get('error')}")
+                        print(f"Failed to get history for #{channel_name}: {history_data.get('error')}")
                         break
                     
                     messages = history_data.get("messages", [])
-                    print(f"📨 Retrieved {len(messages)} messages from #{channel_name}")
+                    print(f"Retrieved {len(messages)} messages from #{channel_name}")
                     channel_messages.extend(messages)
                     
                     # Check if we have more messages
@@ -362,7 +348,7 @@ async def index_workspace_messages(team_id: str, bot_token: str):
                             has_files=bool(msg.get("files")),
                             permalink=permalink
                         ))
-                        print(f"  ✅ Added message: {msg['text'][:50]}...")
+                        print(f"  Added message: {msg['text'][:50]}...")
                     else:
                         # More detailed skip reasons
                         skip_reasons = []
@@ -377,18 +363,18 @@ async def index_workspace_messages(team_id: str, bot_token: str):
                         if msg.get("bot_id"):
                             skip_reasons.append("bot message")
                         
-                        print(f"  ❌ Skipped message: {msg.get('text', '')[:50]}... (reasons: {', '.join(skip_reasons)})")
+                        print(f"  Skipped message: {msg.get('text', '')[:50]}... (reasons: {', '.join(skip_reasons)})")
             
-            print(f"📊 Processing {len(all_messages)} messages for embedding")
+            print(f"Processing {len(all_messages)} messages for embedding")
             
             # Generate embeddings in batches
             if all_messages:
                 await generate_and_store_embeddings_batch(team_id, all_messages)
             
-            print(f"✅ Backfill indexing complete for team {team_id}")
+            print(f"Backfill indexing complete for team {team_id}")
             
     except Exception as e:
-        print(f"❌ Backfill indexing failed for team {team_id}: {e}")
+        print(f"Backfill indexing failed for team {team_id}: {e}")
 
 async def generate_and_store_embeddings_batch(team_id: str, messages: List[SlackMessage]):
     """Generate embeddings in batches to handle large message sets"""
@@ -407,7 +393,7 @@ async def generate_and_store_embeddings_batch(team_id: str, messages: List[Slack
             )
             
             embeddings = response.embeddings
-            print(f"🧠 Generated {len(embeddings)} embeddings for batch {i//batch_size + 1}")
+            print(f"Generated {len(embeddings)} embeddings for batch {i//batch_size + 1}")
             
             # Store in memory with metadata
             for msg, embedding in zip(batch, embeddings):
@@ -415,17 +401,24 @@ async def generate_and_store_embeddings_batch(team_id: str, messages: List[Slack
                     "vector": embedding,
                     "message": asdict(msg),
                     "full_text": msg.text,  # Store original text
-                    "indexed_at": datetime.utcnow().isoformat()
+                    "indexed_at": datetime.now().isoformat()
                 }
                 MESSAGE_VECTORS[team_id].append(vector_data)
+            
+            # Store in LanceDB
+            try:
+                await db_manager.store_message_vectors(team_id, batch, [np.array(emb) for emb in embeddings])
+            except Exception as e:
+                print(f"Failed to store vectors in LanceDB: {e}")
+                print("Continuing with in-memory storage only")
             
             # Rate limiting between batches
             await asyncio.sleep(1)
             
         except Exception as e:
-            print(f"❌ Embedding generation failed for batch {i//batch_size + 1}: {e}")
+            print(f"Embedding generation failed for batch {i//batch_size + 1}: {e}")
     
-    print(f"💾 Stored {len(messages)} vectors for team {team_id}")
+    print(f"Stored {len(messages)} vectors for team {team_id}")
 
 async def generate_and_store_embeddings(team_id: str, messages: List[SlackMessage]):
     """Generate embeddings and store in memory"""
@@ -519,6 +512,9 @@ async def handle_slack_events(request: Request):
                 user_id = event.get("user")
                 if team_id and user_id:
                     asyncio.create_task(handle_app_home_opened(team_id, user_id))
+            elif event.get("type") == "member_joined_channel":
+                # Handle when bot gets added to a channel
+                asyncio.create_task(handle_member_joined_channel(team_id, event))
         
         return {"status": "ok"}
         
@@ -548,17 +544,27 @@ async def process_message_event(team_id: str, event: Dict):
 async def index_new_message(team_id: str, event: Dict):
     """Index a new message with thread context"""
     # Skip bot messages and messages without text
-    if (event.get("subtype") or 
+    # Only skip specific subtypes, not all subtypes
+    skip_subtypes = ["bot_message", "channel_join", "channel_leave", "channel_topic", "channel_purpose"]
+    if (event.get("subtype") in skip_subtypes or 
         event.get("bot_id") or 
         not event.get("text") or 
         len(event["text"].strip()) < 10):
+        print(f"Skipping message: subtype={event.get('subtype')}, bot_id={event.get('bot_id')}, text_len={len(event.get('text', ''))}")
         return
+    
+    print(f"Indexing message: {event.get('text', '')[:100]}... (subtype: {event.get('subtype')}, user: {event.get('user')})")
     
     # Extract thread context
     thread_ts = event.get("thread_ts", event["ts"])
     is_thread_root = thread_ts == event["ts"]
     
     # Create SlackMessage object with thread awareness
+    installation = INSTALLATIONS[team_id]
+    # Use team_domain if available, otherwise use a default
+    team_domain = getattr(installation, 'team_domain', 'workspace')
+    permalink = f"https://{team_domain}.slack.com/archives/{event['channel']}/p{event['ts'].replace('.', '')}"
+    
     message = SlackMessage(
         team_id=team_id,
         channel_id=event["channel"],
@@ -567,11 +573,66 @@ async def index_new_message(team_id: str, event: Dict):
         ts=event["ts"],
         thread_ts=thread_ts,
         has_files=bool(event.get("files")),
-        message_type="message"
+        message_type="message",
+        permalink=permalink
     )
     
     # Generate embedding and store
     await process_single_message(message)
+
+async def index_channel_history(team_id: str, channel_id: str):
+    """Index history for a specific channel when bot is added"""
+    if team_id not in INSTALLATIONS:
+        return
+    
+    installation = INSTALLATIONS[team_id]
+    bot_token = installation.bot_access_token
+    
+    print(f"Starting to index channel {channel_id} history for team {team_id}")
+    
+    try:
+        # Get channel info
+        channel_info = await get_channel_info(bot_token, channel_id)
+        channel_name = channel_info.get("name", channel_id)
+        
+        print(f"Indexing channel #{channel_name} ({channel_id})")
+        
+        # Get channel messages
+        messages = await get_channel_messages(bot_token, channel_id, limit=1000)
+        
+        if not messages:
+            print(f"No messages found in channel {channel_id}")
+            return
+        
+        print(f"Found {len(messages)} messages in channel {channel_id}")
+        
+        # Process messages in batches
+        batch_size = 50
+        for i in range(0, len(messages), batch_size):
+            batch = messages[i:i + batch_size]
+            await generate_and_store_embeddings_batch(team_id, batch)
+            print(f"Processed batch {i//batch_size + 1}/{(len(messages) + batch_size - 1)//batch_size}")
+        
+        # Post completion message
+        await post_slack_message(
+            bot_token,
+            channel_id,
+            f"Channel indexing complete! I've indexed {len(messages)} messages from #{channel_name}. You can now ask me questions about this channel's history."
+        )
+        
+        print(f"Completed indexing channel {channel_id} with {len(messages)} messages")
+        
+    except Exception as e:
+        print(f"Error indexing channel {channel_id}: {e}")
+        # Post error message to channel
+        try:
+            await post_slack_message(
+                bot_token,
+                channel_id,
+                f"Sorry, I encountered an error while indexing this channel's history: {str(e)}"
+            )
+        except:
+            pass
 
 async def handle_message_edit(team_id: str, event: Dict):
     """Handle message edits by updating the existing message"""
@@ -611,6 +672,36 @@ async def handle_message_deletion(team_id: str, event: Dict):
         ]
         print(f"Deleted message {message_ts} for team {team_id}")
 
+async def handle_member_joined_channel(team_id: str, event: Dict):
+    """Handle when bot gets added to a channel"""
+    if team_id not in INSTALLATIONS:
+        return
+    
+    user_id = event.get("user")
+    channel_id = event.get("channel")
+    
+    # Check if the bot itself was added to the channel
+    if user_id and channel_id:
+        installation = INSTALLATIONS[team_id]
+        bot_user_id = installation.bot_user_id
+        
+        if user_id == bot_user_id:
+            print(f"Bot added to channel {channel_id} in team {team_id}")
+            
+            # Post a message to the channel announcing indexing
+            try:
+                await post_slack_message(
+                    installation.bot_access_token,
+                    channel_id,
+                    "Hello! I'm now indexing the channel history to help answer questions. This may take a few minutes depending on the channel size."
+                )
+                
+                # Start indexing the channel history
+                asyncio.create_task(index_channel_history(team_id, channel_id))
+                
+            except Exception as e:
+                print(f"Error posting to channel {channel_id}: {e}")
+
 async def process_app_mention_event(team_id: str, event: Dict):
     """Process app mention events for direct interaction"""
     if team_id not in INSTALLATIONS:
@@ -634,10 +725,24 @@ async def process_app_mention_event(team_id: str, event: Dict):
         
         # Post response back to the channel
         installation = INSTALLATIONS[team_id]
+        
+        # Build response with source links
+        response_text = f"**Answer:** {rag_response.answer}\n\n"
+        
+        if rag_response.sources:
+            response_text += f"**Sources:** Found {len(rag_response.sources)} relevant messages\n"
+            # Add actual source links (these are now clickable Slack links)
+            for i, source in enumerate(rag_response.sources[:3], 1):  # Show first 3 sources
+                response_text += f"  {i}. {source}\n"
+            if len(rag_response.sources) > 3:
+                response_text += f"  ... and {len(rag_response.sources) - 3} more\n"
+        else:
+            response_text += f"**Sources:** No specific sources found\n"
+        
         await post_slack_message(
             installation.bot_access_token,
             event["channel"],
-            f"🤖 **Answer:** {rag_response.answer}\n\n📚 **Sources:** Found {len(rag_response.sources)} relevant messages",
+            response_text,
             thread_ts=event.get("thread_ts")
         )
     except Exception as e:
@@ -717,6 +822,54 @@ async def post_slack_message(bot_token: str, channel: str, text: str, thread_ts:
         
         return response.json()
 
+async def get_channel_info(bot_token: str, channel_id: str) -> Dict:
+    """Get channel information"""
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            "https://slack.com/api/conversations.info",
+            params={
+                "token": bot_token,
+                "channel": channel_id
+            }
+        )
+        result = response.json()
+        if result.get("ok"):
+            return result.get("channel", {})
+        return {}
+
+async def get_channel_messages(bot_token: str, channel_id: str, limit: int = 1000) -> List[Dict]:
+    """Get channel messages"""
+    messages = []
+    cursor = None
+    
+    async with httpx.AsyncClient() as client:
+        while len(messages) < limit:
+            params = {
+                "token": bot_token,
+                "channel": channel_id,
+                "limit": min(200, limit - len(messages))
+            }
+            if cursor:
+                params["cursor"] = cursor
+                
+            response = await client.get(
+                "https://slack.com/api/conversations.history",
+                params=params
+            )
+            
+            result = response.json()
+            if not result.get("ok"):
+                break
+                
+            batch_messages = result.get("messages", [])
+            messages.extend(batch_messages)
+            
+            cursor = result.get("response_metadata", {}).get("next_cursor")
+            if not cursor:
+                break
+                
+    return messages[:limit]
+
 # === Phase 1: Slash Commands ===
 
 @app.post("/slack/commands")
@@ -747,11 +900,11 @@ async def handle_slash_commands(
     
     # Check if app is installed
     if team_id not in INSTALLATIONS:
-        return {"text": "❌ App not properly installed. Please reinstall from the web interface."}
+        return {"text": "App not properly installed. Please reinstall from the web interface."}
     
     # Check if we have indexed messages
     if team_id not in MESSAGE_VECTORS or not MESSAGE_VECTORS[team_id]:
-        return {"text": "⏳ Still indexing messages... Please try again in a minute!"}
+        return {"text": "Still indexing messages... Please try again in a minute!"}
     
     try:
         # Parse command with channel and time filters
@@ -766,26 +919,26 @@ async def handle_slash_commands(
         )
         
         # Format response for Slack with enhanced information
-        response_text = f"🤖 **Answer:** {rag_response.answer}\n\n"
+        response_text = f"**Answer:** {rag_response.answer}\n\n"
         
         if rag_response.sources:
-            response_text += f"📚 **Sources:** Found {len(rag_response.sources)} relevant messages\n"
-            # Add actual source links
+            response_text += f"**Sources:** Found {len(rag_response.sources)} relevant messages\n"
+            # Add actual source links (these are now clickable Slack links)
             for i, source in enumerate(rag_response.sources[:3], 1):  # Show first 3 sources
                 response_text += f"  {i}. {source}\n"
             if len(rag_response.sources) > 3:
                 response_text += f"  ... and {len(rag_response.sources) - 3} more\n"
         else:
-            response_text += f"📚 **Sources:** No specific sources found (using general knowledge)\n"
+            response_text += f"**Sources:** No specific sources found (using general knowledge)\n"
         
         # Add query context
         if parsed_query["channel"]:
-            response_text += f"🔍 **Channel filter:** #{parsed_query['channel']}\n"
+            response_text += f"**Channel filter:** #{parsed_query['channel']}\n"
         if parsed_query["days"] != 30:
-            response_text += f"📅 **Time window:** Last {parsed_query['days']} days\n"
+            response_text += f"**Time window:** Last {parsed_query['days']} days\n"
         
-        response_text += f"⏱️ **Response time:** {rag_response.processing_time:.2f}s\n"
-        response_text += f"🎯 **Confidence:** {rag_response.confidence:.2f}"
+        response_text += f"**Response time:** {rag_response.processing_time:.2f}s\n"
+        response_text += f"**Confidence:** {rag_response.confidence:.2f}"
         
         return {
             "response_type": "in_channel",  # Post publicly
@@ -794,7 +947,7 @@ async def handle_slash_commands(
         
     except Exception as e:
         print(f"Error processing question: {e}")
-        return {"text": f"❌ Error: {str(e)}"}
+        return {"text": f"Error: {str(e)}"}
 
 def parse_ask_command(text: str) -> Dict[str, Any]:
     """Parse /ask command with optional channel and time filters
@@ -871,22 +1024,80 @@ async def answer_question(team_id: str, question: str, channel_filter: str = Non
     # 3. Get time cutoff for filtering
     time_cutoff = time.time() - (time_window_days * 24 * 3600)
     
-    # 4. Hybrid retrieval: BM25 keyword pre-filter + vector similarity
-    vectors = MESSAGE_VECTORS[team_id]
+    # 4. Generate query embedding first
+    query_vector = await generate_query_embedding(question)
+    
+    # 5. Hybrid retrieval: BM25 keyword pre-filter + vector similarity
+    # Try LanceDB first, fallback to in-memory
+    try:
+        # Use LanceDB for vector search
+        lance_results = await db_manager.search_vectors(
+            team_id=team_id,
+            query_vector=query_vector,
+            limit=50,
+            channel_filter=channel_filter,
+            time_cutoff=time_cutoff
+        )
+        
+        if lance_results:
+            # Convert LanceDB results to expected format
+            vectors = []
+            for result in lance_results:
+                vector_data = {
+                    "vector": np.array(result["vector"]),
+                    "message": {
+                        "team_id": result["team_id"],
+                        "channel_id": result["channel_id"],
+                        "user_id": result["user_id"],
+                        "text": result["text"],
+                        "ts": result["message_ts"],
+                        "thread_ts": result["thread_ts"],
+                        "permalink": f"https://{getattr(installation, 'team_domain', 'workspace')}.slack.com/archives/{result['channel_id']}/p{result['message_ts'].replace('.', '')}"
+                    },
+                    "full_text": result["text"],
+                    "indexed_at": result["indexed_at"]
+                }
+                vectors.append(vector_data)
+        else:
+            # Fallback to in-memory storage
+            vectors = MESSAGE_VECTORS[team_id]
+    except Exception as e:
+        print(f"LanceDB search failed, using in-memory fallback: {e}")
+        vectors = MESSAGE_VECTORS[team_id]
+    
     if not vectors:
         raise HTTPException(404, "No indexed messages found")
     
-    print(f"🔍 RAG Debug - Searching through {len(vectors)} indexed messages for team {team_id}")
-    print(f"🔍 RAG Debug - Question: {question}")
+    # Step 1: BM25 keyword pre-filter (only for specific technical queries)
+    # For conversational questions, skip BM25 and go directly to vector search
+    is_conversational = any(phrase in question.lower() for phrase in [
+        "what have we been discussing", "what did we talk about", "recent discussion",
+        "lately", "recently", "what's been happening", "catch me up", "what have we discussed",
+        "what did we discuss", "what was discussed", "what are we discussing", "what's the discussion",
+        "what's been discussed", "what did we cover", "what have we covered", "what was covered"
+    ])
     
-    # Step 1: BM25 keyword pre-filter (simple keyword matching)
-    keyword_candidates = await bm25_keyword_search(question, vectors, time_cutoff, channel_filter, allowed_channels)
+    print(f"RAG Debug - Searching through {len(vectors)} indexed messages for team {team_id}")
+    print(f"RAG Debug - Question: {question}")
+    print(f"RAG Debug - Is conversational: {is_conversational}")
     
-    # Step 2: Vector similarity search on candidates
-    query_vector = await generate_query_embedding(question)
+    # Debug: Show sample of indexed messages
+    if vectors:
+        print(f"RAG Debug - Sample indexed messages:")
+        for i, vector_data in enumerate(vectors[:3]):
+            text_preview = vector_data["message"]["text"][:50]
+            print(f"  {i+1}. {text_preview}... (user: {vector_data['message']['user_id']})")
+    else:
+        print("RAG Debug - No vectors found!")
     
-    # If we have keyword candidates, search only those; otherwise search all
-    search_vectors = keyword_candidates if keyword_candidates else vectors
+    if is_conversational or len(question.split()) > 8:  # Longer questions benefit from full vector search
+        search_vectors = vectors
+        print(f"RAG Debug - Using full vector search ({len(search_vectors)} vectors)")
+    else:
+        keyword_candidates = await bm25_keyword_search(question, vectors, time_cutoff, channel_filter, allowed_channels)
+        # Use keyword candidates if we found good matches, otherwise use all vectors
+        search_vectors = keyword_candidates if len(keyword_candidates) >= 5 else vectors
+        print(f"RAG Debug - BM25 found {len(keyword_candidates)} candidates, using {len(search_vectors)} vectors for search")
     
     similarities = []
     for i, vector_data in enumerate(search_vectors):
@@ -910,10 +1121,34 @@ async def answer_question(team_id: str, question: str, channel_filter: str = Non
         similarities.append((similarity, i, vector_data))
     
     # Get top 20 candidates for reranking
+    # For conversational questions, boost recent messages
+    if is_conversational:
+        # Add recency boost to similarity scores
+        current_time = time.time()
+        for i, (similarity, idx, vector_data) in enumerate(similarities):
+            indexed_at = vector_data.get("indexed_at", "")
+            if indexed_at:
+                try:
+                    indexed_time = datetime.fromisoformat(indexed_at.replace('Z', '+00:00')).timestamp()
+                    # Boost recent messages (within last 7 days get +0.1 boost)
+                    if current_time - indexed_time < 7 * 24 * 3600:
+                        similarities[i] = (similarity + 0.1, idx, vector_data)
+                except:
+                    pass
+    
     similarities.sort(reverse=True, key=lambda x: x[0])
     top_candidates = similarities[:20]
     
-    if not top_candidates or top_candidates[0][0] < 0.1:  # Even lower threshold
+    # Debug: Show top similarity scores
+    print(f"RAG Debug - Top similarity scores:")
+    for i, (score, idx, vector_data) in enumerate(top_candidates[:5]):
+        text_preview = vector_data["message"]["text"][:50]
+        print(f"  {i+1}. Score: {score:.3f} - {text_preview}...")
+    
+    # Use lower threshold for conversational questions
+    min_threshold = 0.05 if is_conversational else 0.1
+    
+    if not top_candidates or top_candidates[0][0] < min_threshold:
         return RAGResponse(
             answer="I couldn't find relevant information to answer your question. Try rephrasing or asking about different topics that might be in the indexed messages.",
             sources=[],
@@ -948,7 +1183,7 @@ async def answer_question(team_id: str, question: str, channel_filter: str = Non
     expanded_context = await expand_thread_context(team_id, core_results)
     
     # Debug: Print what context we're using
-    print(f"🔍 RAG Debug - Found {len(expanded_context)} context messages")
+    print(f"RAG Debug - Found {len(expanded_context)} context messages")
     for i, ctx in enumerate(expanded_context[:3]):  # Show first 3
         print(f"  Context {i+1}: {ctx['message']['text'][:100]}...")
     
@@ -964,37 +1199,55 @@ async def answer_question(team_id: str, question: str, channel_filter: str = Non
     )
 
 async def bm25_keyword_search(query: str, vectors: List[Dict], time_cutoff: float, channel_filter: str = None, allowed_channels: List[str] = None) -> List[Dict]:
-    """Simple BM25-style keyword pre-filtering"""
+    """Enhanced BM25-style keyword pre-filtering with better matching"""
     query_words = set(query.lower().split())
     candidates = []
+    
+    # Remove common stop words for better matching
+    stop_words = {"the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by", "is", "are", "was", "were", "be", "been", "have", "has", "had", "do", "does", "did", "will", "would", "could", "should", "may", "might", "can", "what", "how", "when", "where", "why", "who"}
+    query_words = query_words - stop_words
     
     for vector_data in vectors:
         text = vector_data.get("full_text", vector_data["message"]["text"]).lower()
         
-        # Simple keyword matching
+        # Apply filters first
+        if channel_filter and vector_data["message"]["channel_id"] != channel_filter:
+            continue
+        if allowed_channels and vector_data["message"]["channel_id"] not in allowed_channels:
+            continue
+        
+        # Apply time filter
+        indexed_at = vector_data.get("indexed_at", "")
+        if indexed_at:
+            try:
+                indexed_time = datetime.fromisoformat(indexed_at.replace('Z', '+00:00')).timestamp()
+                if indexed_time < time_cutoff:
+                    continue
+            except:
+                pass
+        
+        # Enhanced keyword matching
         text_words = set(text.split())
         overlap = len(query_words.intersection(text_words))
         
+        # Also check for partial matches and synonyms
         if overlap > 0:
-            # Apply filters
-            if channel_filter and vector_data["message"]["channel_id"] != channel_filter:
-                continue
-            if allowed_channels and vector_data["message"]["channel_id"] not in allowed_channels:
-                continue
+            candidates.append((overlap, vector_data))
+        else:
+            # Check for partial word matches (e.g., "document" matches "documents")
+            partial_matches = 0
+            for query_word in query_words:
+                for text_word in text_words:
+                    if query_word in text_word or text_word in query_word:
+                        partial_matches += 0.5
+                        break
             
-            # Apply time filter
-            indexed_at = vector_data.get("indexed_at", "")
-            if indexed_at:
-                try:
-                    indexed_time = datetime.fromisoformat(indexed_at.replace('Z', '+00:00')).timestamp()
-                    if indexed_time < time_cutoff:
-                        continue
-                except:
-                    pass
-            
-            candidates.append(vector_data)
+            if partial_matches > 0:
+                candidates.append((partial_matches, vector_data))
     
-    return candidates[:50]  # Limit to top 50 for vector search
+    # Sort by relevance and return top candidates
+    candidates.sort(reverse=True, key=lambda x: x[0])
+    return [candidate[1] for candidate in candidates[:50]]
 
 async def generate_query_embedding(question: str) -> List[float]:
     """Generate query embedding with Cohere"""
@@ -1096,44 +1349,49 @@ async def generate_with_citations(query: str, context_messages: List[Dict]) -> D
         except:
             pass
         
-        # Create a more informative source citation
+        # Create a more informative source citation with clickable link
         if msg_data.get("permalink"):
-            source_text = f"Message in {channel_name} (permalink available)"
+            # Create clickable link using Slack's link format
+            source_text = f"<{msg_data['permalink']}|Message in {channel_name}>"
         else:
+            # Fallback without link
             source_text = f"Message in {channel_name} by user {user_id}"
         
         sources.append(source_text)
     
     context = "\n\n".join(context_parts)
     
+    # Debug: Print context being sent to AI
+    print(f"RAG Debug - Context being sent to AI:")
+    print(f"Context length: {len(context)} characters")
+    print(f"Context preview: {context[:200]}...")
+    
     # Enhanced prompt for better responses
-    prompt = f"""You are a helpful AI assistant that answers questions based on Slack messages. You have access to the following context from Slack conversations.
+    prompt = f"""Based on the following Slack messages, please answer the user's question. Be helpful and provide any relevant information you can find.
 
-Context from Slack messages:
+Slack Messages:
 {context}
 
-Question: {query}
+User Question: {query}
 
-Instructions:
-1. ONLY use information from the Slack messages provided above
-2. If the context contains relevant information, provide a specific answer based on that information
-3. If the context doesn't contain enough information to answer the question, say "I don't have enough information from the Slack messages to answer this question"
-4. Be specific and reference what was discussed in the messages
-5. Keep your response concise but informative
-6. Do NOT provide generic advice or general knowledge - only use the Slack message context
+Please provide a helpful answer based on the Slack messages above. If the messages contain relevant information, use it to answer the question. Be specific about what was discussed in the messages. If the messages don't directly answer the question but contain related information, provide that information. Only say you don't have enough information if the messages are completely unrelated to the question.
 
 Answer:"""
 
     try:
         response = cohere_client.generate(
-            model="command-r-plus",
+            model="command-light",
             prompt=prompt,
-            max_tokens=400,
-            temperature=0.3,
+            max_tokens=500,
+            temperature=0.7,
             stop_sequences=["\n\nHuman:", "\n\nUser:", "\n\nQuestion:"]
         )
         
         answer = response.generations[0].text.strip()
+        
+        # Debug: Print AI response
+        print(f"RAG Debug - AI Response:")
+        print(f"Response: {answer}")
         
         return {
             "answer": answer,
@@ -1273,15 +1531,15 @@ async def help_page():
         </style>
     </head>
     <body>
-        <h1>🤖 Slack RAG Bot - Help & Setup</h1>
+        <h1>Slack RAG Bot - Help & Setup</h1>
         
         <div class="warning">
-            <h3>⚠️ Bot Not Reading Messages?</h3>
+            <h3>Bot Not Reading Messages?</h3>
             <p>If the bot isn't finding any messages, it likely needs to be invited to channels first.</p>
         </div>
         
         <div class="section">
-            <h3>📋 How to Invite Bot to Channels</h3>
+            <h3>How to Invite Bot to Channels</h3>
             <ol>
                 <li><strong>Go to any channel</strong> where you want the bot to read messages</li>
                 <li><strong>Type this command:</strong> <span class="code">/invite @YourBotName</span></li>
@@ -1337,7 +1595,7 @@ async def help_page():
         </div>
         
         <div class="section">
-            <h3>📊 Check Status</h3>
+            <h3>Check Status</h3>
             <p><a href="/health">View system health</a> | <a href="/installations">View installations</a></p>
         </div>
         
@@ -1437,7 +1695,7 @@ def build_app_home_view(team_id: str, user_id: str, is_admin: bool) -> dict:
             "blocks": [
                 {
                     "type": "header",
-                    "text": {"type": "plain_text", "text": "🤖 RAG Assistant"}
+                    "text": {"type": "plain_text", "text": "RAG Assistant"}
                 },
                 {
                     "type": "section",
@@ -1450,13 +1708,13 @@ def build_app_home_view(team_id: str, user_id: str, is_admin: bool) -> dict:
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"*Current Status:*\n• ✅ Bot is active\n• 📊 {len(MESSAGE_VECTORS.get(team_id, []))} messages indexed\n• 🔍 Ready to answer questions"
+                        "text": f"*Current Status:*\n• Bot is active\n• {len(MESSAGE_VECTORS.get(team_id, []))} messages indexed\n• Ready to answer questions"
                     }
                 },
                 {
                     "type": "context",
                     "elements": [
-                        {"type": "mrkdwn", "text": "💡 *Tip:* Ask specific questions for better results!"}
+                        {"type": "mrkdwn", "text": "*Tip:* Ask specific questions for better results!"}
                     ]
                 }
             ]
@@ -1470,7 +1728,7 @@ def build_app_home_view(team_id: str, user_id: str, is_admin: bool) -> dict:
         "blocks": [
             {
                 "type": "header",
-                "text": {"type": "plain_text", "text": "🤖 RAG Assistant - Admin Settings"}
+                    "text": {"type": "plain_text", "text": "RAG Assistant - Admin Settings"}
             },
             {
                 "type": "section",
@@ -1484,13 +1742,13 @@ def build_app_home_view(team_id: str, user_id: str, is_admin: bool) -> dict:
                 "elements": [
                     {
                         "type": "button",
-                        "text": {"type": "plain_text", "text": "📊 View Statistics"},
+                        "text": {"type": "plain_text", "text": "View Statistics"},
                         "action_id": "view_stats",
                         "style": "primary"
                     },
                     {
                         "type": "button",
-                        "text": {"type": "plain_text", "text": "🔄 Reindex Messages"},
+                        "text": {"type": "plain_text", "text": "Reindex Messages"},
                         "action_id": "reindex_messages"
                     }
                 ]
