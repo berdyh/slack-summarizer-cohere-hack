@@ -1,0 +1,17 @@
+# Core FastAPI dependencies
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# HTTP client for Slack API calls
+httpx>=0.25.2
+
+# AI/ML dependencies
+cohere>=4.37.0
+numpy>=1.26.0
+
+# Data validation
+pydantic>=2.5.0
+
+# Development dependencies (optional)
+python-dotenv>=1.0.0

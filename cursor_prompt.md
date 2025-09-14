@@ -581,5 +581,24 @@ ngrok http 8000
 - **"App not installed"**: Complete OAuth flow first
 - **"No messages"**: Wait for indexing, check channel permissions
 - **Cohere errors**: Verify COHERE_API_KEY is valid
+- **"redirect_uri did not match"**: Update .env file with correct ngrok URL
+
+**Slash Command Issues:**
+- **"/ask command not working"**: Use @bot mentions instead
+- **Bot not responding to /ask**: Try mentioning the bot directly: `@YourBotName What did we discuss?`
+- **Slash commands not appearing**: Check Slack app configuration and ensure commands are properly set up
+
+**OAuth Configuration Rule:**
+When encountering OAuth redirect URI mismatch errors, simply update the `.env` file with the correct ngrok URL:
+```bash
+BASE_URL=https://your-ngrok-url.ngrok-free.app
+```
+And ensure the Slack app's OAuth redirect URL matches: `https://your-ngrok-url.ngrok-free.app/slack/oauth`
+
+**Bot Interaction Rule:**
+If slash commands (`/ask`) are not working, use bot mentions instead:
+- Type `@YourBotName` followed by your question
+- Example: `@YourBotName What did we discuss about the new feature?`
+- The bot will respond to mentions and process the question using the same RAG pipeline
 
 This single-file implementation gets you a working Slack RAG bot in 3 hours with impressive AI capabilities!
