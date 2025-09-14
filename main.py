@@ -26,7 +26,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Core dependencies
-from fastapi import FastAPI, Request, HTTPException, Form, Depends
+from fastapi import FastAPI, Request, HTTPException, Form, Depends, Header
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -36,6 +36,17 @@ from pydantic import BaseModel
 
 # Import HTML response functions
 from html_responses import home_page, oauth_success_response, oauth_error_response
+
+# Import Phase 4 modules
+from monitoring import (
+    metrics_collector, log_installation_event, log_security_event, 
+    log_performance_issue, estimate_cohere_cost, get_metrics_response
+)
+from evaluation import RAGEvaluator, run_automated_evaluation, generate_evaluation_report
+from admin_tools import (
+    DataExporter, DataManager, SystemHealthMonitor, AuditManager,
+    generate_admin_token, verify_admin_token, log_admin_action
+)
 
 # Environment setup
 SLACK_CLIENT_ID = os.getenv("SLACK_CLIENT_ID")
@@ -1701,10 +1712,244 @@ Summary:"""
         except:
             pass
 
+# === Phase 4: Operations & Evaluation Endpoints ===
+
+# Initialize admin tools
+data_exporter = DataExporter(INSTALLATIONS, MESSAGE_VECTORS)
+data_manager = DataManager(INSTALLATIONS, MESSAGE_VECTORS)
+health_monitor = SystemHealthMonitor(INSTALLATIONS, MESSAGE_VECTORS)
+audit_manager = AuditManager()
+
+# === Monitoring Endpoints ===
+
+@app.get("/metrics")
+async def prometheus_metrics():
+    """Prometheus metrics endpoint"""
+    return get_metrics_response()
+
+@app.get("/health/detailed")
+async def detailed_health():
+    """Detailed system health check"""
+    health_status = await health_monitor.get_system_health()
+    return health_status
+
+@app.get("/health/installation/{team_id}")
+async def installation_health(team_id: str):
+    """Get health status for a specific installation"""
+    health_status = await health_monitor.get_installation_health(team_id)
+    return health_status
+
+# === Evaluation Endpoints ===
+
+@app.post("/evaluate/{team_id}")
+async def evaluate_team(team_id: str):
+    """Run automated evaluation for a team"""
+    try:
+        evaluator = RAGEvaluator(answer_question)
+        report = await evaluator.evaluate_team(team_id)
+        
+        # Log evaluation
+        log_installation_event(
+            team_id=team_id,
+            event_type="evaluation_completed",
+            evaluation_score=report.average_overall_score
+        )
+        
+        return {
+            "status": "completed",
+            "team_id": team_id,
+            "evaluation_time": report.evaluation_time.isoformat(),
+            "summary": {
+                "total_questions": report.total_questions,
+                "successful_questions": report.successful_questions,
+                "average_overall_score": report.average_overall_score,
+                "average_response_time": report.average_response_time
+            },
+            "recommendations": report.recommendations
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Evaluation failed: {str(e)}")
+
+@app.get("/evaluate/{team_id}/report")
+async def get_evaluation_report(team_id: str):
+    """Get evaluation report for a team"""
+    try:
+        evaluator = RAGEvaluator(answer_question)
+        report = await evaluator.evaluate_team(team_id)
+        report_text = generate_evaluation_report(report)
+        
+        return {
+            "team_id": team_id,
+            "report": report_text,
+            "raw_data": asdict(report)
+        }
+    except Exception as e:
+        raise HTTPException(500, f"Report generation failed: {str(e)}")
+
+# === Admin Endpoints ===
+
+@app.post("/admin/token")
+async def create_admin_token(team_id: str, admin_user_id: str):
+    """Create admin token for team management"""
+    token = generate_admin_token(team_id, admin_user_id)
+    return {
+        "token": token,
+        "expires_in_hours": 24,
+        "team_id": team_id
+    }
+
+@app.get("/admin/export/{team_id}")
+async def export_team_data(team_id: str, admin_token: str = Header(None)):
+    """Export all data for a team (GDPR compliance)"""
+    if not admin_token:
+        raise HTTPException(401, "Admin token required")
+    
+    token_info = verify_admin_token(admin_token)
+    if token_info["team_id"] != team_id:
+        raise HTTPException(403, "Token not valid for this team")
+    
+    export_data = await data_exporter.export_team_data(team_id, token_info["admin_user_id"])
+    return export_data
+
+@app.get("/admin/export/{team_id}/csv")
+async def export_team_data_csv(team_id: str, admin_token: str = Header(None)):
+    """Export team data as CSV file"""
+    if not admin_token:
+        raise HTTPException(401, "Admin token required")
+    
+    token_info = verify_admin_token(admin_token)
+    if token_info["team_id"] != team_id:
+        raise HTTPException(403, "Token not valid for this team")
+    
+    return await data_exporter.export_team_data_csv(team_id, token_info["admin_user_id"])
+
+@app.get("/admin/stats/{team_id}")
+async def get_team_statistics(team_id: str, admin_token: str = Header(None)):
+    """Get comprehensive statistics for a team"""
+    if not admin_token:
+        raise HTTPException(401, "Admin token required")
+    
+    token_info = verify_admin_token(admin_token)
+    if token_info["team_id"] != team_id:
+        raise HTTPException(403, "Token not valid for this team")
+    
+    stats = await data_exporter.get_team_statistics(team_id)
+    return stats
+
+@app.delete("/admin/purge/{team_id}")
+async def purge_team_data(team_id: str, admin_token: str = Header(None)):
+    """Purge all data for a team (GDPR compliance)"""
+    if not admin_token:
+        raise HTTPException(401, "Admin token required")
+    
+    token_info = verify_admin_token(admin_token)
+    if token_info["team_id"] != team_id:
+        raise HTTPException(403, "Token not valid for this team")
+    
+    result = await data_manager.purge_team_data(team_id, token_info["admin_user_id"])
+    return result
+
+@app.put("/admin/retention/{team_id}")
+async def update_retention_policy(team_id: str, retention_days: int, admin_token: str = Header(None)):
+    """Update data retention policy for a team"""
+    if not admin_token:
+        raise HTTPException(401, "Admin token required")
+    
+    token_info = verify_admin_token(admin_token)
+    if token_info["team_id"] != team_id:
+        raise HTTPException(403, "Token not valid for this team")
+    
+    result = await data_manager.update_retention_policy(team_id, retention_days, token_info["admin_user_id"])
+    return result
+
+@app.put("/admin/allowlist/{team_id}")
+async def update_channel_allowlist(team_id: str, channel_allowlist: List[str], admin_token: str = Header(None)):
+    """Update channel allowlist for a team"""
+    if not admin_token:
+        raise HTTPException(401, "Admin token required")
+    
+    token_info = verify_admin_token(admin_token)
+    if token_info["team_id"] != team_id:
+        raise HTTPException(403, "Token not valid for this team")
+    
+    result = await data_manager.update_channel_allowlist(team_id, channel_allowlist, token_info["admin_user_id"])
+    return result
+
+@app.put("/admin/deactivate/{team_id}")
+async def deactivate_installation(team_id: str, admin_token: str = Header(None)):
+    """Deactivate installation for a team"""
+    if not admin_token:
+        raise HTTPException(401, "Admin token required")
+    
+    token_info = verify_admin_token(admin_token)
+    if token_info["team_id"] != team_id:
+        raise HTTPException(403, "Token not valid for this team")
+    
+    result = await data_manager.deactivate_installation(team_id, token_info["admin_user_id"])
+    return result
+
+@app.put("/admin/reactivate/{team_id}")
+async def reactivate_installation(team_id: str, admin_token: str = Header(None)):
+    """Reactivate installation for a team"""
+    if not admin_token:
+        raise HTTPException(401, "Admin token required")
+    
+    token_info = verify_admin_token(admin_token)
+    if token_info["team_id"] != team_id:
+        raise HTTPException(403, "Token not valid for this team")
+    
+    result = await data_manager.reactivate_installation(team_id, token_info["admin_user_id"])
+    return result
+
+@app.get("/admin/audit/{team_id}")
+async def get_audit_log(team_id: str, admin_token: str = Header(None), limit: int = 100):
+    """Get audit log for a team"""
+    if not admin_token:
+        raise HTTPException(401, "Admin token required")
+    
+    token_info = verify_admin_token(admin_token)
+    if token_info["team_id"] != team_id:
+        raise HTTPException(403, "Token not valid for this team")
+    
+    audit_log = await audit_manager.get_audit_log(team_id, limit)
+    return audit_log
+
+@app.get("/admin/compliance/{team_id}")
+async def get_compliance_report(team_id: str, admin_token: str = Header(None)):
+    """Get compliance report for a team"""
+    if not admin_token:
+        raise HTTPException(401, "Admin token required")
+    
+    token_info = verify_admin_token(admin_token)
+    if token_info["team_id"] != team_id:
+        raise HTTPException(403, "Token not valid for this team")
+    
+    compliance_report = await audit_manager.get_compliance_report(team_id)
+    return compliance_report
+
+# === Enhanced Health Check with Metrics ===
+
+@app.get("/health")
+async def health():
+    """Enhanced health check with system metrics"""
+    health_status = await health_monitor.get_system_health()
+    
+    # Update system metrics
+    indexed_messages = {team_id: len(vectors) for team_id, vectors in MESSAGE_VECTORS.items()}
+    metrics_collector.update_system_metrics(len(INSTALLATIONS), indexed_messages)
+    
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "installations": len(INSTALLATIONS),
+        "total_vectors": sum(len(vectors) for vectors in MESSAGE_VECTORS.values()),
+        "system_health": health_status
+    }
+
 # === Run the Application ===
 
 if __name__ == "__main__":
     print("Starting Slack RAG Bot...")
     print("Visit http://localhost:8000 to install the bot")
-    print("Make sure to set up your Slack app and environment variables")
+    print("Phase 4: Operations & Evaluation - COMPLETE")
     uvicorn.run(app, host="0.0.0.0", port=8000)

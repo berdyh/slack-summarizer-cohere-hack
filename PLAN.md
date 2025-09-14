@@ -618,16 +618,113 @@ python-docx>=0.8.11  # Word doc extraction
 - [ ] **Data retention policies** with automatic purging
 - [ ] **HTTPS everywhere** with proper certificate management
 
+## Phase 5: Production Database Integration (Next Priority)
+
+### 5.1 LanceDB Vector Database Integration
+**Current Issue**: System uses in-memory Python dictionaries for storage, which is not production-ready.
+
+**LanceDB Benefits**:
+- **Local Vector Storage**: No external API dependencies
+- **High Performance**: Optimized for vector similarity search
+- **Multi-tenant Support**: Namespace-based isolation
+- **Persistent Storage**: Data survives application restarts
+- **Cost Effective**: No per-query costs like Pinecone/Weaviate
+
+**Implementation Plan**:
+```python
+# Replace in-memory storage with LanceDB
+import lancedb
+import pyarrow as pa
+
+# Initialize LanceDB
+db = lancedb.connect("./data/lancedb")
+table = db.create_table(
+    "slack_messages",
+    schema=pa.schema([
+        pa.field("id", pa.string()),
+        pa.field("team_id", pa.string()),
+        pa.field("channel_id", pa.string()),
+        pa.field("message_ts", pa.string()),
+        pa.field("thread_ts", pa.string()),
+        pa.field("user_id", pa.string()),
+        pa.field("text", pa.string()),
+        pa.field("vector", pa.list_(pa.float32())),
+        pa.field("indexed_at", pa.timestamp('us')),
+        pa.field("deleted_at", pa.timestamp('us'))
+    ])
+)
+
+# Multi-tenant querying with team_id filtering
+def query_vectors(team_id: str, query_vector: List[float], limit: int = 20):
+    return table.search(query_vector).where(f"team_id = '{team_id}'").limit(limit).to_pandas()
+```
+
+### 5.2 PostgreSQL Integration for Metadata
+**Replace in-memory installations and user cache**:
+```python
+# PostgreSQL schema for persistent metadata
+CREATE TABLE slack_installations (
+    team_id VARCHAR(20) PRIMARY KEY,
+    installer_user_id VARCHAR(20) NOT NULL,
+    bot_access_token TEXT NOT NULL, -- encrypted
+    scopes TEXT[] NOT NULL,
+    installation_time TIMESTAMP DEFAULT NOW(),
+    channel_allowlist TEXT[],
+    retention_days INTEGER DEFAULT 90,
+    is_active BOOLEAN DEFAULT true,
+    settings JSONB DEFAULT '{}'
+);
+
+CREATE TABLE slack_users (
+    team_id VARCHAR(20) NOT NULL,
+    user_id VARCHAR(20) NOT NULL,
+    username VARCHAR(50),
+    display_name VARCHAR(100),
+    is_admin BOOLEAN DEFAULT false,
+    last_updated TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY(team_id, user_id)
+);
+```
+
+### 5.3 Migration Strategy
+1. **Phase 5.1**: Implement LanceDB for vector storage
+2. **Phase 5.2**: Add PostgreSQL for metadata storage
+3. **Phase 5.3**: Create migration scripts from in-memory to persistent storage
+4. **Phase 5.4**: Update all Phase 4 admin tools to work with persistent storage
+5. **Phase 5.5**: Add data backup and recovery mechanisms
+
+### 5.4 Updated Dependencies
+```txt
+# Vector database
+lancedb>=0.3.0
+pyarrow>=12.0.0
+
+# Relational database
+asyncpg>=0.29.0
+sqlalchemy>=2.0.0
+alembic>=1.12.0  # Database migrations
+
+# Data validation
+pydantic>=2.5.0
+```
+
+### 5.5 Performance Benefits
+- **Persistence**: Data survives application restarts
+- **Scalability**: Handle millions of messages per team
+- **Performance**: Optimized vector search with LanceDB
+- **Reliability**: ACID transactions with PostgreSQL
+- **Multi-tenancy**: Proper data isolation between teams
+
 ## Future Enhancements (Post-MVP)
 
-### Phase 5: Advanced Features
+### Phase 6: Advanced Features
 - Socket Mode for behind-firewall deployments
 - Enterprise Grid support for large orgs  
 - Advanced summarization (daily/weekly digests)
 - Multi-language support with language detection
 - Custom model fine-tuning on workspace data
 
-### Phase 6: Enterprise
+### Phase 7: Enterprise
 - SSO integration (SAML/OIDC)
 - Advanced compliance (SOC 2, HIPAA)
 - On-premise deployment options
