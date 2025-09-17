@@ -58,16 +58,16 @@ async def check_environment():
             missing_required.append(var)
     
     if missing_required:
-        print(f"❌ Missing required environment variables: {', '.join(missing_required)}")
+        print(f"Missing required environment variables: {', '.join(missing_required)}")
         print("Please add these to your .env file")
         return False
-    
-    print("✅ All required environment variables are set")
-    
+
+    print("All required environment variables are set")
+
     # Check optional variables
     for var in optional_vars:
         if not os.getenv(var):
-            print(f"⚠️  Optional variable {var} not set, using default")
+            print(f"Optional variable {var} not set, using default")
     
     return True
 

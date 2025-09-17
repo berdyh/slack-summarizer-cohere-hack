@@ -338,34 +338,6 @@ class DatabaseManager:
                 values={"deleted_at": datetime.utcnow()}
             )
     
-    # === Migration from In-Memory ===
-    
-    async def migrate_from_memory(self, installations: Dict, message_vectors: Dict, user_cache: Dict):
-        """Migrate data from in-memory storage to persistent databases"""
-        print("Starting migration from in-memory to persistent storage...")
-        
-        # Migrate installations
-        for team_id, installation in installations.items():
-            await self.store_installation(installation)
-        
-        # Migrate users
-        for (team_id, user_id), user in user_cache.items():
-            await self.store_user(user)
-        
-        # Migrate message vectors
-        for team_id, vectors in message_vectors.items():
-            if vectors:
-                # Extract messages and vectors
-                messages = []
-                vector_arrays = []
-                
-                for vector_data in vectors:
-                    messages.append(vector_data["message"])
-                    vector_arrays.append(vector_data["vector"])
-                
-                await self.store_message_vectors(team_id, messages, vector_arrays)
-        
-        print("Migration complete")
 
 # Global database manager instance
 db_manager = DatabaseManager()
